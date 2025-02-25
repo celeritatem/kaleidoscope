@@ -7,12 +7,21 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 // #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm/IR/PassInstrumentation.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
 #include <memory>
@@ -369,7 +378,8 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
     // anon proto
-    auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr",
+                                                std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
   return nullptr;
@@ -383,6 +393,13 @@ static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::map<std::string, Value *> NamedValues;
+static std::unique_ptr<FunctionPassManager> TheFPM;
+static std::unique_ptr<LoopAnalysisManager> TheLAM;
+static std::unique_ptr<FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<StandardInstrumentations> TheSI;
 
 Value *LogErrorV(const char *Str) {
   LogError(Str);
@@ -488,6 +505,9 @@ Function *FunctionAST::codegen() {
 
     verifyFunction(*TheFunction);
 
+    // optimize the function
+    TheFPM->run(*TheFunction, *TheFAM);
+
     return TheFunction;
   }
 
@@ -500,11 +520,38 @@ Function *FunctionAST::codegen() {
 // Top level parsing
 // =========================
 
-static void InitializeModule() {
+static void InitializeModuleAndManagers() {
+  // context and module
   TheContext = std::make_unique<LLVMContext>();
   TheModule = std::make_unique<Module>("kaleidoscope", *TheContext);
+  // TheModule->setDataLayout(TheJIT->getDataLayout());
 
+  // builder
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+  // Create pass and analysis managers
+  TheFPM = std::make_unique<FunctionPassManager>();
+  TheLAM = std::make_unique<LoopAnalysisManager>();
+  TheFAM = std::make_unique<FunctionAnalysisManager>();
+  TheCGAM = std::make_unique<CGSCCAnalysisManager>();
+  TheMAM = std::make_unique<ModuleAnalysisManager>();
+  ThePIC = std::make_unique<PassInstrumentationCallbacks>();
+  TheSI = std::make_unique<StandardInstrumentations>(*TheContext,
+                                                     /*DebugLogging*/ true);
+
+  TheSI->registerCallbacks(*ThePIC, TheMAM.get());
+
+  // Add transform passes
+  TheFPM->addPass(InstCombinePass());
+  TheFPM->addPass(ReassociatePass());
+  TheFPM->addPass(GVNPass());
+  TheFPM->addPass(SimplifyCFGPass());
+
+  // Register analysis passes used in the transform passes
+  PassBuilder PB;
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 }
 
 static void HandleDefinition() {
@@ -585,7 +632,7 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
-  InitializeModule();
+  InitializeModuleAndManagers();
 
   MainLoop();
 
